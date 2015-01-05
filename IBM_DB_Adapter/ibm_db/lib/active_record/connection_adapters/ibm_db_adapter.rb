@@ -725,7 +725,7 @@ module ActiveRecord
       def self.visitor_for(pool)
         Arel::Visitors::IBM_DB.new(pool)
       end
-      
+=begin      
       def to_sql(arel, binds = [])
         if arel.respond_to?(:ast)
           visitor.accept(arel.ast) do
@@ -735,7 +735,7 @@ module ActiveRecord
           arel
         end
       end
-
+=end
       # This adapter supports migrations.
       # Current limitations:
       # +rename_column+ is not currently supported by the IBM data servers
@@ -1118,7 +1118,7 @@ module ActiveRecord
       end
 
       def insert(arel, name = nil, pk = nil, id_value = nil, sequence_name = nil, binds = [] )
-        sql, binds = [to_sql(arel),binds]
+        sql, binds = sql_for_insert(to_sql(arel, binds), pk, id_value, sequence_name, binds) #[to_sql(arel),binds]
 
         #unless IBM_DBAdapter.respond_to?(:exec_insert)
         if binds.nil? || binds.empty?
@@ -1278,7 +1278,7 @@ module ActiveRecord
       alias_method :prepared_delete, :prepared_update
 
       def update(arel, name = nil, binds = [])
-        sql = to_sql(arel)
+        sql = to_sql(arel,binds)
 
         # Make sure the WHERE clause handles NULL's correctly
         sqlarray = sql.split(/\s*WHERE\s*/)
@@ -1335,6 +1335,13 @@ module ActiveRecord
         IBM_DB.autocommit @connection, IBM_DB::SQL_AUTOCOMMIT_ON
       end
 
+      def get_limit_offset_clauses(limit,offset)
+        if limit && limit == 0
+          clauses = @servertype.get_limit_offset_clauses(limit,0)
+        else
+          clauses = @servertype.get_limit_offset_clauses(limit, offset)
+        end
+      end
 
       # Modifies a sql statement in order to implement a LIMIT and an OFFSET.
       # A LIMIT defines the number of rows that should be fetched, while
@@ -1459,7 +1466,7 @@ module ActiveRecord
               end
           elsif column && column.type.to_sym == :text
               unless caller[0] =~ /add_column_options/i
-                "'@@@IBMTEXT@@@'"
+                "'<ibm>@@@IBMTEXT@@@</ibm>'"
               else
                 @servertype.set_text_default(quote_string(value))
               end
@@ -1879,7 +1886,8 @@ module ActiveRecord
               if !(column_name =~ /db2_generated_rowid_for_lobs/i)
                 # Pushes into the array the *IBM_DBColumn* object, created by passing to the initializer
                 # +column_name+, +default_value+, +column_type+ and +column_nullable+.
-                columns << IBM_DBColumn.new(column_name, column_default_value, column_type, column_nullable)
+                cast_type = lookup_cast_type(column_type)
+                columns << IBM_DBColumn.new(column_name, column_default_value, cast_type, column_type, column_nullable)
               end
             end
           rescue StandardError => fetch_error # Handle driver fetch errors
@@ -2008,6 +2016,47 @@ module ActiveRecord
       # Overriden to use the IBM data servers SQL syntax.
       def remove_index(table_name, options = {})
         execute("DROP INDEX #{index_name(table_name, options)}")
+      end
+
+      protected
+      def initialize_type_map(m) # :nodoc:
+        register_class_with_limit m, %r(boolean)i,   Type::Boolean
+        register_class_with_limit m, %r(char)i,      Type::String
+        register_class_with_limit m, %r(binary)i,    Type::Binary
+        register_class_with_limit m, %r(text)i,      Type::Text
+        register_class_with_limit m, %r(date)i,      Type::Date
+        register_class_with_limit m, %r(time)i,      Type::Time
+        register_class_with_limit m, %r(datetime)i,  Type::DateTime
+        register_class_with_limit m, %r(float)i,     Type::Float
+        register_class_with_limit m, %r(int)i,       Type::Integer
+
+        m.alias_type %r(blob)i,      'binary'
+        m.alias_type %r(clob)i,      'text'
+        m.alias_type %r(timestamp)i, 'datetime'
+        m.alias_type %r(numeric)i,   'decimal'
+        m.alias_type %r(number)i,    'decimal'
+        m.alias_type %r(double)i,    'float'
+
+        m.register_type(%r(decimal)i) do |sql_type|
+          scale = extract_scale(sql_type)
+          precision = extract_precision(sql_type)
+
+          if scale == 0
+            # FIXME: Remove this class as well
+            Type::DecimalWithoutScale.new(precision: precision)
+          else
+            Type::Decimal.new(precision: precision, scale: scale)
+          end
+        end
+
+        m.alias_type %r(xml)i,      'text'
+        m.alias_type %r(for bit data)i,      'binary'
+        m.alias_type %r(smallint)i,      'boolean'
+        m.alias_type %r(serial)i,      'int'
+        m.alias_type %r(decfloat)i,      'decimal'
+        m.alias_type %r(real)i,      'decimal'
+        m.alias_type %r(graphic)i,      'binary'
+        m.alias_type %r(rowid)i,      'int'
       end
     end # class IBM_DBAdapter
 
@@ -2143,6 +2192,9 @@ To remove the column, the table must be dropped and recreated without the #{colu
       end
 
       def query_offset_limit(sql, offset, limit)
+      end
+
+      def get_limit_offset_clauses(limit, offset)
       end
 
       def query_offset_limit!(sql, offset, limit, options)
@@ -2507,6 +2559,30 @@ SET WITH DEFAULT #{@adapter.quote(default)}"
         end
       end
 =end
+      def get_limit_offset_clauses(limit, offset)
+        retHash = {"endSegment"=> "", "startSegment" => ""}
+        if(offset.nil? && limit.nil?)
+          return retHash
+        end
+
+        if (offset.nil?)
+           retHash["endSegment"] = " FETCH FIRST #{limit} ROWS ONLY"
+           return retHash
+        end
+
+        if(limit.nil?)
+          retHash["startSegment"] = "SELECT O.* FROM (SELECT I.*, ROW_NUMBER() OVER () sys_row_num FROM ( SELECT "
+          retHash["endSegment"] = " ) AS I) AS O WHERE sys_row_num > #{offset}"
+          return retHash
+        end
+
+        # Defines what will be the last record
+        last_record = offset.to_i + limit.to_i
+        retHash["startSegment"] = "SELECT O.* FROM (SELECT I.*, ROW_NUMBER() OVER () sys_row_num FROM ( SELECT "
+        retHash["endSegment"] = " ) AS I) AS O WHERE sys_row_num BETWEEN #{offset+1} AND #{last_record}"
+        return retHash
+      end
+
       def query_offset_limit(sql, offset, limit)
         if(offset.nil? && limit.nil?)
           return sql
@@ -2727,6 +2803,14 @@ SET WITH DEFAULT #{@adapter.quote(default)}"
     class IBM_DB2_ZOS_8 < IBM_DB2_ZOS
       include HostedDataServer
 
+      def get_limit_offset_clauses(limit, offset)
+        retHash = {"startSegment" => "", "endSegment" => ""}
+        if (!limit.nil?)
+           retHash["endSegment"] = " FETCH FIRST #{limit} ROWS ONLY"
+        end
+        return retHash
+      end
+
       def query_offset_limit(sql, offset, limit)
         if (!limit.nil?)
            sql << " FETCH FIRST #{limit} ROWS ONLY"
@@ -2889,6 +2973,22 @@ SET WITH DEFAULT #{@adapter.quote(default)}"
         return "double precision"
       end
 
+      def get_limit_offset_clauses(limit, offset)
+        retHash = {"startSegment" => "", "endSegment" => ""}
+        if limit != 0
+          if !offset.nil?
+            # Modifying the SQL to utilize the skip and limit amounts
+            retHash["startSegment"] = " SELECT SKIP #{offset} LIMIT #{limit} "
+          else
+            # Modifying the SQL to retrieve only the first #{limit} rows
+            retHash["startSegment"] = " SELECT FIRST #{limit} "
+          end
+        else
+          retHash["startSegment"] = " SELECT * FROM (SELECT "
+          retHash["endSegment"] = " ) WHERE 0 = 1 "
+        end
+      end
+
       # Handling offset/limit as per Informix requirements
       def query_offset_limit(sql, offset, limit)
         if limit != 0
@@ -2968,11 +3068,24 @@ SET WITH DEFAULT #{@adapter.quote(default)}"
 end # module ActiveRecord
 
 module Arel
+  module Collectors
+    class Bind
+      def changeFirstSegment(segment)
+        @parts[0] = segment
+      end
+
+      def changeEndSegment(segment)
+        len = @parts.length
+        @parts[len] = segment
+      end
+    end
+  end
+
   module Visitors
     class Visitor #opening and closing the class to ensure backward compatibility
     end
 
-    class ToSql < Arel::Visitors::Visitor #opening and closing the class to ensure backward compatibility
+    class ToSql < Arel::Visitors::Reduce #opening and closing the class to ensure backward compatibility
       # In case when using Rails-2.3.x there is no arel used due to which the constructor has to be defined explicitly
       # to ensure the same code works on any version of Rails
       
@@ -2985,6 +3098,7 @@ module Arel
 
       if(@arelVersion >= 3)
         def initialize connection
+          super()
           @connection     = connection
           @schema_cache   = connection.schema_cache if(connection.respond_to?(:schema_cache))
           @quoted_tables  = {}
@@ -2997,44 +3111,67 @@ module Arel
     class IBM_DB < Arel::Visitors::ToSql
       private
 
-      def visit_Arel_Nodes_Limit o, a=nil
-        visit o.expr
+      def visit_Arel_Nodes_Limit o,collector
+        visit o.expr, collector
       end
 
-      def visit_Arel_Nodes_Offset o, a=nil
-        visit o.expr
+      def visit_Arel_Nodes_Offset o,collector
+        visit o.expr,collector
       end
 
-      def visit_Arel_Nodes_SelectStatement o, a=nil
-        #Interim  fix for backward compatibility [Arel 4.0.0 and below]
-        if self.method(:visit_Arel_Nodes_SelectCore).arity == 1
-          sql = [
-            (visit(o.with) if o.with),
-            o.cores.map { |x| visit_Arel_Nodes_SelectCore x }.join,
-            ("ORDER BY #{o.orders.map { |x| visit x }.join(', ')}" unless o.orders.empty?),
-          ].compact.join ' '
-        else
-          sql = [
-            (visit(o.with) if o.with),
-            o.cores.map { |x| visit_Arel_Nodes_SelectCore x,a }.join,
-            ("ORDER BY #{o.orders.map { |x| visit x }.join(', ')}" unless o.orders.empty?),
-          ].compact.join ' '
+      def visit_Arel_Nodes_SelectStatement o, collector
+
+        if o.with
+          collector = visit o.with, collector
+          collector << SPACE
+        end
+
+        collector = o.cores.inject(collector) { |c,x|
+          visit_Arel_Nodes_SelectCore(x, c)
+        }
+
+        unless o.orders.empty?
+          collector << SPACE
+          collector << ORDER_BY
+          len = o.orders.length - 1
+          o.orders.each_with_index { |x, i|
+            collector = visit(x, collector)
+            collector << COMMA unless len == i
+          }
         end
 
         if o.limit
-          limit = visit(o.limit)
+          limcoll = Arel::Collectors::SQLString.new
+          visit(o.limit,limcoll)
+          limit = limcoll.value.to_i
         else
           limit = nil
         end
 
         if o.offset
-          offset = visit(o.offset)
+          offcoll = Arel::Collectors::SQLString.new
+          visit(o.offset,offcoll)
+          offset = offcoll.value.to_i
         else
           offset = nil
         end
-        @connection.add_limit_offset!(sql, {:limit => limit, :offset => offset})
-        sql << " #{(visit(o.lock) if o.lock)}"
-        return sql
+
+        limOffClause = @connection.get_limit_offset_clauses(limit,offset)
+
+        if( !limOffClause["startSegment"].empty? ) 
+          collector.changeFirstSegment(limOffClause["startSegment"])
+        end
+        
+        if( !limOffClause["endSegment"].empty? )
+          collector.changeEndSegment(limOffClause["endSegment"])
+        end
+
+        #Initialize a new Collector and set its value to the sql string built so far with any limit and ofset modifications
+        #collector.reset(sql)
+
+        collector = maybe_visit o.lock, collector
+
+	return collector
       end
 
     end
